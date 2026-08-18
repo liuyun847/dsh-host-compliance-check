@@ -1,0 +1,22 @@
+{
+  "name": "dsh-host-compliance-check",
+  "description": "DSH 宿主插件:每个用户输入的轮次内,若修改过文件则在结束时自动派发需求合规检查子智能体(阻塞执行),报告注入主会话(迁移自 Trae stop-hook)",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-subagent": "^0.1.0-rc.6"
+  }
+}
