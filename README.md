@@ -37,7 +37,7 @@ DSH(DeepSeek Harness)宿主插件:每个用户输入轮次结束时,若本轮修
    // package.json
    {
      "dependencies": {
-       "dsh-host-compliance-check": "github:<你的用户名>/dsh-host-compliance-check"
+       "dsh-host-compliance-check": "github:liuyun847/dsh-host-compliance-check"
      }
    }
    ```
