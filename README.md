@@ -1,31 +1,51 @@
 # dsh-host-compliance-check
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](package.json)
 [![DSH Plugin](https://img.shields.io/badge/dsh-plugin-8A2BE2.svg)](https://github.com/topics/dsh-plugin)
 
-DSH(DeepSeek Harness)宿主插件:每个用户输入轮次结束时,若本轮修改过文件,自动派发一个**需求合规检查子智能体**(阻塞执行),把检查报告注入主会话,防止"改完就忘、需求没对齐就收尾"(迁移自 Trae 的 PostToolUse + Stop hook)。
+DSH(DeepSeek Harness)宿主插件:模仿 Trae 的 stop-hook 配置(hooks.json 的
+PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;在主会话
+轮次正常结束时,若本轮修改过文件,向主会话注入一段 **notice 形态的合规提醒
+提示词**(source.form='notice' + 一句话 summary,正文带文件清单),由主模型
+当场自行判断:直接收尾 / 简要自查 / 阻塞调用 subagent 深入检查。
+
+> (v0.4.0 变更) 与 0.3.x 的差异:
+> - **收集信源从"会话事件日志 + run_code 源码启发式解析"改为 `tools/result`
+>   实时精确记录** —— 顶层 write/edit 与 run_code 内 `tools.write/edit`
+>   子派发都经工具管道 emit `tools/result`(`exec.name`/`exec.arguments` 为真实
+>   调用,`exec.agent` 携带会话),`file_path` 精确,删除正则猜源码的脆弱逻辑;
+> - 注入消息由裸 plugin 文本改为 **notice 形态**(`form:'notice'` + `summary`
+>   ≤120,`boundContextSummary` 语义),不再以 `[AUTO]` 文本冒充用户输入;
+> - diag 日志路径改为基于 `DSH_HOME`/用户主目录推导,不再硬编码。
 
 ## 特性
 
-- 轮末自动检查:轮次正常结束时,若本轮改过文件且尚未检查,阻塞派发检查子智能体,报告注入主会话
-- 每用户输入最多检查一次,避免重复
-- 防递归:检查子智能体自身纳入豁免集
-- 净 diff 注入:同一文件多次编辑合并为首版 before → 最终 after 的行级 diff(近似 unified diff 多 hunk)
-- 内容截断保护:超大 diff 按字符/行数上限截断,并提示检查子智能体 read 原文件查看全貌
+- 轮末提醒:主会话轮次正常结束时,若本轮修改过文件且本用户输入尚未提醒过,
+  注入 notice 提醒(进 next-step 队列 → 本 turn 继续,主模型当场看到并响应,
+  响应完 turn 才真正结束 —— 等价 Trae 的 block)
+- **精确收集 = `tools/result` 实时记录**(对顶层 write/edit 与 run_code 内子派发
+  均触发;scope-filtered 按 agent 分发):
+  - `exec.name` ∈ {write, edit} 且成功 → 提取真实 `file_path`;
+  - 事件日志仅作兜底(顶层 `tool/call` 的 write/edit),不再解析 run_code 源码
+- **只支持标准模式写入**;PTC 裸写(`await import('node:fs')` + 直接文件 API,
+  绕过 `tools` 绑定)不经过工具管道、不产生 `tools/result`,本插件检测不到
+  (已知限制;合规做法是程序内用 `tools.write/edit`)
+- 每用户输入最多提醒一次(新用户消息经 `agent/pre-step` 复位记录与标记)
+- 只对主会话触发:**GUI 恢复/续写历史会话创建的 fork 会话(带 parentSession、无 origin)视为主会话**,照常提醒;仅排除子代理会话(header `origin: 'subagent'`),避免嵌套提醒
+- 提示词携带**全部用户输入历史**(按时间顺序拼接、跳过插件注入,超长截断保留最新)供对照,
+  不只取最近一条;内置自查清单与处理方式引导(可直接结束 / 阻塞调 subagent 深查)
+- 提醒以 **notice** 消息呈现(`source.form='notice'`,summary 一句话 ≤120),UI 折叠展示、不冒充用户输入
 
 ## 配置(cordis.patch.yml 的 entry config)
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `watchTools` | `['write', 'edit']` | 记录哪些写工具修改 |
-| `skipPaths` | `[]` | 跳过匹配的路径(RegExp/字符串数组) |
-| `providerName` | `'subagent-fork-in-process'` | 检查子智能体的 provider |
-| `promptTemplate` | 内置模板 | 自定义模板,支持 `{{requirement}}` / `{{files}}` / `{{diff}}` |
-| `diffMaxChars` | `0` | 注入 prompt 的 diff 总字符上限,0 = 不限制 |
-| `diffMaxLinesPerFile` | `0` | 单文件 diff 行数上限,0 = 不限制 |
+| `skipPaths` | `[]` | 跳过匹配的路径(RegExp/字符串数组),命中则不记录 |
+| `diag` | `false` | 写诊断日志到 `~/.dsh/compliance-diag.log`(DSH_HOME 优先;排查用) |
 
-极端大 diff 场景(超大文件整段重写、多文件大改)可按需设置上限,例如 `diffMaxChars: 8000`、`diffMaxLinesPerFile: 200`。
+(0.2.x 的 `providerName`/`promptTemplate`/`diffMaxChars`/`diffMaxLinesPerFile`/`watchTools`
+与 0.3.x 的源码解析逻辑均已移除。)
 
 ## 安装
 
@@ -37,14 +57,14 @@ DSH(DeepSeek Harness)宿主插件:每个用户输入轮次结束时,若本轮修
    // package.json
    {
      "dependencies": {
-       "dsh-host-compliance-check": "github:liuyun847/dsh-host-compliance-check"
+       "dsh-host-compliance-check": "file:./plugins/dsh-host-compliance-check"
      }
    }
    ```
 
    然后 `pnpm install`(或 `npm install`)。
 
-2. 在 `cordis.patch.yml` 中注册插件行(可加 config 覆盖默认值):
+2. 在 `cordis.patch.yml` 中注册插件行:
 
    ```yaml
    - insert:
@@ -54,21 +74,36 @@ DSH(DeepSeek Harness)宿主插件:每个用户输入轮次结束时,若本轮修
 
 3. 重启 `dsh web` 生效。
 
+> 注意:本仓库以 `plugins/dsh-host-compliance-check/` 为**活源**,运行时加载
+> `node_modules/` 下的 **file: 拷贝**(二者独立)。改动活源后需把
+> `lib/index.js`、`package.json`、`tests/` 同步复制到
+> `node_modules/dsh-host-compliance-check/`,再重启 dsh 才生效。
+
 ## 工作原理
 
-- 监听 `tools/result`(≈ PostToolUse):记录本轮修改过的文件及 before/after 内容,嵌套工具调用经 parent token 冒泡到顶层
-- 监听 `agent/turn-stopping`(≈ Stop):轮次要正常结束时,若本轮改过文件且未检查,派发检查子智能体并 `await` 其完成,主会话挂起
-- 检查子智能体返回报告即完成(无完成标记协议),每个用户输入最多触发一次
+- 监听 `agent/pre-step`:检测到用户新消息(`source.kind === 'user'`)时复位
+  该会话的"已提醒"标记与本轮写入记录;
+- 监听 `tools/result`:每次工具成功结束(顶层或 run_code 子派发),若是
+  write/edit 则把精确 `file_path` 记入该会话本轮表(应用 skipPaths 过滤);
+- 监听 `agent/turn-stopping`(≈ Trae Stop):仅主会话且未提醒过、本轮表非空时,
+  `agent.inject` 注入 notice 提醒 —— 注入 next-step 使本 turn 继续,主模型当场响应;
+- 事件日志兜底:仅当实时记录缺失时,从会话事件取顶层 `tool/call` 的 write/edit;
+- 提示词正文带文件清单、本轮用户输入摘录、自查清单与处理方式引导(可直接结束或
+  阻塞调 subagent/subagent_fork 深查);
+- **已知边界**:run_code 程序内 PTC 裸写(`await import('node:fs')` 等直接文件
+  API,绕过 `tools` 绑定)不产生 `tools/result`,本插件不检测;如需要覆盖请改用
+  `tools.write/edit`;
+- 无子代理派发、无 `ctx.get('subagents')` 依赖。
 
-## 测试
+## 开发
 
-纯逻辑回归测试(无 DSH 运行时):
-
+```bash
+pnpm install
+# 修改活源 plugins/dsh-host-compliance-check/ 后,同步 lib/ 与 package.json 到
+# node_modules/dsh-host-compliance-check/(file: 拷贝,不自动同步),再重启 dsh
+# 纯函数单测(提取/记录/收集/提示词组装):
+node plugins/dsh-host-compliance-check/tests/diff.test.mjs
 ```
-node tests/diff.test.mjs
-```
-
-退出码 0 = 通过。
 
 ## License
 

@@ -1,18 +1,23 @@
 /**
- * dsh-host-compliance-check 回归测试(只读,不改动插件本身)。
+ * dsh-host-compliance-check v0.4.0 回归测试(只读,不改动插件本身)。
  *
  * 运行方式(工作目录不限):
  *   node tests/diff.test.mjs
  *
  * 原理:读取 ../lib/index.js 源码,剥离 import 与 export 关键字(当前仅单行 import),
- * 再以 new Function 装载进本进程执行断言。
- * 若 lib/index.js 的 import/export 结构变化导致装载失效,测试会直接报语法错误,请同步更新本文件头部的剥离逻辑。
+ * 再以 new Function 装载进本进程执行断言。由于模块顶层有 import { createUserMessage }
+ * 等 ESM 依赖,剥离后仅测试不触碰这些依赖的纯函数(collectTurnWritesFromEvents、
+ * lastUserMessageText 等不调用外部依赖;buildNoticeMessage 依赖 createUserMessage,
+ * 仅在存在该绑定时测;否则跳过)。
  *
- * 覆盖范围:
- *  - 行级 diff 渲染:新建/中段替换/整删/空内容/CRLF/多 hunk/超大中间段降级/尾部追加/行尾换行
- *  - 截断:单文件行数上限、总字符上限、代理对(emoji)不切断
- *  - buildPrompt:文件列表、diff 区块、{{requirement}}/{{files}}/{{diff}} 模板、多次编辑合并语义
- *  - resolveConfig:默认值(0 不限制)与非法配置抛错
+ * 覆盖范围(0.4.0):
+ *  - extractFilePath:字符串/对象/非法 JSON/无 file_path 的提取
+ *  - noteTurnWrite/sessionTurnWrites/clearSessionTurnWrites:精确优先、去重、复位
+ *  - collectTurnWritesFromEvents:只取顶层 tool/call 的 write/edit(带 turn),run_code 不解析源码
+ *  - isRootSession:主会话判定(origin!=='subagent')
+ *  - lastUserMessageText:跳过插件注入与 goal、按序拼接、截断保最新、不切代理对
+ *  - buildPromptBody:文件清单/自查清单/处理引导/用户历史
+ *  - buildNoticeMessage(若 createUserMessage 可剥离注入):source.form='notice' + summary≤120
  */
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -23,9 +28,15 @@ const pluginSrc = readFileSync(join(here, '..', 'lib', 'index.js'), 'utf8')
   .replace(/^\s*import\s+.*$/gm, '')
   .replace(/^\s*export\s+/gm, '')
 
-// 装载插件源码(其导出在当前上下文不可见,故剥离 import 后拼接测试尾)
-const runner = new Function(pluginSrc + '\n;return { resolveConfig, buildPrompt, renderFileDiff, renderDiff, safeSlice, computeLineEdits };')
-const { resolveConfig, buildPrompt, renderFileDiff, renderDiff, safeSlice, computeLineEdits } = runner()
+// 装载插件源码。buildNoticeMessage 用到 createUserMessage,剥离 import 后不可见,
+// 故在剥离后的源码末尾追加一个占位 createUserMessage(只返回结构化消息,不依赖
+// 真实 dsh-llm),仅验证 source 形态与 summary 截断。
+const injected = '\nfunction createUserMessage(input) { return { id: "msg-" + Math.random(), role: "user", ...input } }\n'
+const runner = new Function(pluginSrc + injected + '\n;return { safeSlice, extractFilePath, noteTurnWrite, sessionTurnWrites, clearSessionTurnWrites, collectTurnWritesFromEvents, lastUserMessageText, isRootSession, buildPromptBody, buildNoticeMessage };')
+const {
+  safeSlice, extractFilePath, noteTurnWrite, sessionTurnWrites, clearSessionTurnWrites,
+  collectTurnWritesFromEvents, lastUserMessageText, isRootSession, buildPromptBody, buildNoticeMessage,
+} = runner()
 
 let pass = 0
 let fail = 0
@@ -33,111 +44,119 @@ function check(name, cond, detail) {
   if (cond) { pass++; console.log('PASS ' + name) }
   else { fail++; console.log('FAIL ' + name + (detail ? '\n' + detail : '')) }
 }
-const hasCR = (s) => s.split('').some((ch) => ch.charCodeAt(0) === 13)
 const isLoneSurrogateTail = (s) => {
   const c = s.charCodeAt(s.length - 1)
   return c >= 0xd800 && c <= 0xdbff
 }
 
-// ── 一、行级 diff 渲染 ─────────────────────────────
-const r1 = renderFileDiff('a/new.txt', null, 'line1\nline2\nline3')
-check('diff.create-file', r1.includes('@@ -0,0 +1,3 @@') && r1.includes('+line1') && r1.includes('+line3'), r1)
+// ── 一、extractFilePath ─────────────────────────────
+check('extract.obj', extractFilePath({ file_path: 'C:/a/b.txt' }) === 'C:/a/b.txt')
+check('extract.jsonstr', extractFilePath('{"file_path":"C:/a/b.txt"}') === 'C:/a/b.txt')
+check('extract.badjson', extractFilePath('{oops') === null)
+check('extract.no-field', extractFilePath({ path: 'x' }) === null)
+check('extract.empty', extractFilePath({ file_path: '' }) === null)
+check('extract.null', extractFilePath(null) === null && extractFilePath(undefined) === null)
+check('extract.backslash', extractFilePath({ file_path: 'C:\\a\\b.txt' }) === 'C:\\a\\b.txt')
 
-const before2 = ['aaa', 'bbb', 'ccc', 'ddd', 'eee', 'fff', 'ggg'].join('\n')
-const after2 = ['aaa', 'bbb', 'CCC!!', 'DDD!!', 'eee', 'fff', 'ggg'].join('\n')
-const r2 = renderFileDiff('b/edit.txt', before2, after2)
-check('diff.mid-edit', r2.includes('@@ -1,7 +1,7 @@') && r2.includes('-ccc') && r2.includes('+CCC!!') && r2.includes('-ddd') && r2.includes('+DDD!!') && r2.includes(' aaa') && r2.includes(' ggg'), r2)
+// ── 二、noteTurnWrite / sessionTurnWrites / clear ──
+noteTurnWrite('s1', 'C:/x/a.md', false)
+noteTurnWrite('s1', 'C:/x/b.md', true)
+noteTurnWrite('s1', 'C:/x/a.md', true) // 已精确,推断不降级
+noteTurnWrite('s1', 'C:\\x\\c.md', false) // 反斜杠规整
+noteTurnWrite('s1', '', false) // 空忽略
+const w1 = sessionTurnWrites('s1')
+check('note.collects', w1?.size === 3, w1 ? String(w1.size) : 'none')
+check('note.exact-wins', w1?.get('C:/x/a.md')?.inferred === false)
+check('note.inferred-marked', w1?.get('C:/x/b.md')?.inferred === true)
+check('note.normalize-backslash', w1?.has('C:/x/c.md'))
+check('note.session-isolated', sessionTurnWrites('s2') === undefined)
+clearSessionTurnWrites('s1')
+check('note.clear', sessionTurnWrites('s1') === undefined)
 
-const r3 = renderFileDiff('c/del.txt', 'x\ny\nz', '')
-check('diff.delete-all', r3.includes('@@ -1,3 +0,0 @@') && r3.includes('-x') && r3.includes('-z'), r3)
+// ── 三、collectTurnWritesFromEvents(事件兜底,只收顶层 write/edit) ──
+const agentEv = {
+  session: {
+    ownEvents: () => [
+      { type: 'tool/call', data: { turn: 5, name: 'write', arguments: '{"file_path":"C:/t/w.txt"}' } },
+      { type: 'tool/call', data: { turn: 5, name: 'edit', arguments: { file_path: 'C:/t/e.txt' } } },
+      { type: 'tool/call', data: { turn: 5, name: 'run_code', arguments: '{"code":"fs.writeFileSync(\'C:/t/fromcode.txt\', \'x\')"}' } },
+      { type: 'tool/call', data: { turn: 6, name: 'write', arguments: '{"file_path":"C:/t/other-turn.txt"}' } },
+      { type: 'tool/call', data: { turn: 5, name: 'read', arguments: '{"file_path":"C:/t/read.txt"}' } },
+    ],
+  },
+  phase: { turn: 5 },
+}
+const evFiles = collectTurnWritesFromEvents(agentEv, 5)
+check('events.precise-write', evFiles.has('C:/t/w.txt'))
+check('events.precise-edit', evFiles.has('C:/t/e.txt'))
+check('events.no-runcode-source-parse', !evFiles.has('C:/t/fromcode.txt'), JSON.stringify([...evFiles.keys()]))
+check('events.turn-filtered', !evFiles.has('C:/t/other-turn.txt'))
+check('events.no-read', !evFiles.has('C:/t/read.txt'))
+check('events.size', evFiles.size === 2, String(evFiles.size))
 
-const r4 = renderFileDiff('d/empty.txt', '', '')
-check('diff.no-diff', r4.includes('(无文本差异)'), r4)
+// 无 ownEvents 时回退 snapshotEvents
+const agentSnap = { session: { snapshotEvents: () => [{ type: 'tool/call', data: { turn: 2, name: 'write', arguments: { file_path: 'C:/s/x.txt' } } }] } }
+check('events.snapshot-fallback', collectTurnWritesFromEvents(agentSnap, 2).has('C:/s/x.txt'))
+check('events.no-events', collectTurnWritesFromEvents({ session: {} }, 1).size === 0)
+check('events.null-agent', collectTurnWritesFromEvents(null, 1).size === 0)
 
-const r5 = renderFileDiff('e/crlf.txt', 'a\r\nb\r\n', 'a\r\nb\r\nc')
-check('diff.crlf', r5.includes('+c') && !hasCR(r5), r5)
+// ── 四、isRootSession ───────────────────────────────
+check('scope.origin-subagent-false', !isRootSession({ header: { origin: 'subagent' } }))
+check('scope.origin-undefined-true', isRootSession({ header: {} }))
+check('scope.origin-other-true', isRootSession({ header: { origin: 'something' } }))
+check('scope.null-false', !isRootSession(null) && !isRootSession(undefined))
 
-const bigBefore = Array.from({ length: 20 }, (_, i) => 'old' + i).join('\n')
-const bigAfter = Array.from({ length: 20 }, (_, i) => 'new' + i).join('\n')
-const r6 = renderFileDiff('f/big.txt', bigBefore, bigAfter, 6)
-check('diff.trunc-lines', r6.split('\n').length <= 8 && r6.includes('已按 diffMaxLinesPerFile=6 截断'), r6)
+// ── 五、lastUserMessageText(跳插件注入/goal、拼接、截断) ──
+const agentMsgs = {
+  session: {
+    snapshotEvents: () => [
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第一句' }] } },
+      { type: 'user/message', data: { source: { kind: 'plugin', plugin: 'x' }, content: [{ type: 'text', text: '注入跳过' }] } },
+      { type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: 'goal 跳过' }] } },
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第二句' }] } },
+    ],
+  },
+}
+const all = lastUserMessageText(agentMsgs, 4000)
+check('user.all', all.includes('第一句') && all.includes('第二句'))
+check('user.plugin-skipped', !all.includes('注入跳过') && !all.includes('goal 跳过'))
+check('user.order', all.indexOf('第一句') < all.indexOf('第二句'))
+check('user.undefined-none', lastUserMessageText({ session: { snapshotEvents: () => [] } }, 10) === undefined)
 
-const before7 = Array.from({ length: 30 }, (_, i) => 'l' + i).join('\n')
-const after7 = before7.replace('l2', 'L2!').replace('l25', 'L25!')
-const r7 = renderFileDiff('g/multi.txt', before7, after7)
-check('diff.multi-hunk', ((r7.match(/@@/g) || []).length / 2) === 2, r7)
-
-const hugeA = Array.from({ length: 3000 }, (_, i) => 'a' + i).join('\n')
-const hugeB = Array.from({ length: 3000 }, (_, i) => 'B' + i).join('\n')
-const r8 = renderFileDiff('h/huge.txt', hugeA, hugeB)
-check('diff.huge-fallback', r8.split('\n').length > 5000, String(r8.split('\n').length))
-
-const r9 = renderFileDiff('i/append.txt', 'x\ny', 'x\ny\nz')
-check('diff.append', r9.includes('@@ -1,2 +1,3 @@') && r9.includes('+z'), r9)
-
-const r10 = renderFileDiff('j/trail.txt', 'x\n\n', 'x\n\ny')
-check('diff.trailing-newline', r10.includes('+y') && !r10.includes('-\n'), JSON.stringify(r10))
-
-// ── 二、截断与代理对 ───────────────────────────────
-const emoji = 'A'.repeat(100) + '🎉'.repeat(50)
-const e1 = safeSlice(emoji, 120)
-check('slice.no-lone-surrogate', !isLoneSurrogateTail(e1) && e1.length <= 120, e1 + ' len=' + e1.length)
-
-const bigMap = new Map([['big.txt', {
-  before: Array.from({ length: 30 }, (_, i) => 'o' + i).join('\n'),
-  after: Array.from({ length: 30 }, (_, i) => 'n' + i).join('\n'),
-}]])
-const r11 = renderDiff(bigMap, 60, 0)
-check('diff.trunc-chars', r11.includes('已按 diffMaxChars=60 截断') && !isLoneSurrogateTail(r11), r11)
-
-// ── 三、buildPrompt 集成 ───────────────────────────
-const files = new Map([
-  ['a/new.txt', { before: null, after: 'A\nB' }],
-  ['b/edit.txt', { before: 'x\ny\nz', after: 'x\nY2\nz' }],
-])
-const agent = { session: { events: [
-  { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '重构 b 并新增 a' }] } },
+const longAgent = { session: { snapshotEvents: () => [
+  { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '旧' + 'x'.repeat(5000) }] } },
+  { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '新需求' }] } },
 ] } }
-const resolved0 = { diffMaxChars: 0, diffMaxLinesPerFile: 0 }
-const prompt = buildPrompt(agent, files, resolved0)
-check('prompt.has-files', prompt.includes('## 本轮修改的文件') && prompt.includes('- a/new.txt') && prompt.includes('- b/edit.txt'))
-check('prompt.has-diff', prompt.includes('## 本轮改动 diff') && prompt.includes('@@ -0,0 +1,2 @@') && prompt.includes('-y') && prompt.includes('+Y2'))
-check('prompt.has-requirement', prompt.includes('重构 b 并新增 a'))
-check('prompt.quality-item', prompt.includes('实现质量如何'))
+const trunc = lastUserMessageText(longAgent, 50)
+check('user.trunc-keeps-new', trunc.includes('新需求') && !trunc.includes('旧'))
+check('user.trunc-marker', trunc.startsWith('…(已截断)'))
+check('user.trunc-length', trunc.length <= 50 + '…(已截断)'.length + 1, String(trunc.length))
+check('user.trunc-no-lone-surrogate', !isLoneSurrogateTail(trunc))
 
-const prompt2 = buildPrompt({ session: { events: [] } }, files, resolved0)
-check('prompt.no-requirement', prompt2.includes('无法从会话中提取'))
+// ── 六、buildPromptBody ─────────────────────────────
+const pfiles = new Map([
+  ['C:/a/new.md', { inferred: false }],
+  ['C:/b/edit.md', { inferred: true }],
+])
+const body = buildPromptBody(pfiles, '改 a 和 b')
+check('prompt.files', body.includes('本轮修改了文件:') && body.includes('- C:/a/new.md') && body.includes('- C:/b/edit.md'))
+check('prompt.quality', body.includes('需求是否完成') && body.includes('是否引入新问题'))
+check('prompt.guidance', body.includes('subagent') && body.includes('排除误报') && body.includes('做适当改进'))
+check('prompt.history', body.includes('## 用户输入历史') && body.includes('改 a 和 b'))
+check('prompt.no-requirement', !buildPromptBody(pfiles, undefined).includes('## 用户输入历史'))
 
-const prompt3 = buildPrompt(agent, files, { ...resolved0, promptTemplate: '需求:{{requirement}}\n文件:\n{{files}}\n差异:\n{{diff}}' })
-check('prompt.template-diff', prompt3.startsWith('需求:') && prompt3.includes('差异:\n### a/new.txt') && prompt3.includes('@@ -0,0 +1,2 @@'))
+// ── 七、buildNoticeMessage(source notice 形态) ──
+const notice = buildNoticeMessage({ content: '正文', summary: 's'.repeat(200) })
+check('notice.role-user', notice.role === 'user')
+check('notice.source-plugin', notice.source?.kind === 'plugin' && notice.source?.plugin === 'compliance-check')
+check('notice.source-form', notice.source?.form === 'notice')
+check('notice.summary-bounded', notice.source?.summary?.length <= 120, String(notice.source?.summary?.length))
+check('notice.content', notice.content?.[0]?.text === '正文')
 
-const prompt4 = buildPrompt(agent, bigMap, { diffMaxChars: 0, diffMaxLinesPerFile: 4 })
-check('prompt.trunc-lines', prompt4.includes('已按 diffMaxLinesPerFile=4 截断') && prompt4.includes('可 read 该文件查看全貌'))
-
-const prompt5 = buildPrompt(agent, bigMap, { diffMaxChars: 60, diffMaxLinesPerFile: 0 })
-const diffPart = (prompt5.split('## 本轮改动 diff')[1] ?? '').split('## 检查项')[0] ?? ''
-check('prompt.trunc-chars', prompt5.includes('已按 diffMaxChars=60 截断') && diffPart.length < 200 && diffPart.length > 50, diffPart)
-
-const prompt6 = buildPrompt(agent, new Map([['f.txt', { before: null, after: 'v2' }]]), resolved0)
-check('prompt.merge-after', prompt6.includes('+v2') && !prompt6.includes('+v1'))
-
-const prompt7 = buildPrompt(agent, new Map([['e.txt', { before: '', after: '' }]]), resolved0)
-check('prompt.empty-content', prompt7.includes('(无文本差异)'))
-
-// ── 四、resolveConfig ──────────────────────────────
-const rc = resolveConfig({})
-check('config.defaults', rc.diffMaxChars === 0 && rc.diffMaxLinesPerFile === 0 && rc.promptTemplate === undefined)
-let threw = false
-try { resolveConfig({ diffMaxChars: -1 }) } catch (e) { threw = e instanceof TypeError }
-check('config.reject-negative', threw)
-threw = false
-try { resolveConfig({ diffMaxLinesPerFile: 1.5 }) } catch (e) { threw = e instanceof TypeError }
-check('config.reject-fraction', threw)
-threw = false
-try { resolveConfig({ watchTools: [] }) } catch (e) { threw = e instanceof TypeError }
-check('config.reject-empty-watch', threw)
-const rc2 = resolveConfig({ diffMaxChars: 8000, diffMaxLinesPerFile: 200 })
-check('config.custom-values', rc2.diffMaxChars === 8000 && rc2.diffMaxLinesPerFile === 200)
+// safeSlice(代理对不切断)
+const emoji = 'A'.repeat(100) + '🎉'.repeat(50)
+check('slice.no-lone-surrogate', !isLoneSurrogateTail(safeSlice(emoji, 120)) && safeSlice(emoji, 120).length <= 120)
+check('slice.identity', safeSlice('abc', 10) === 'abc')
 
 console.log('----')
 console.log('pass=' + pass + ' fail=' + fail)
