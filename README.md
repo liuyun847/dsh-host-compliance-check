@@ -1,14 +1,14 @@
 # dsh-host-compliance-check
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](package.json)
 [![DSH Plugin](https://img.shields.io/badge/dsh-plugin-8A2BE2.svg)](https://github.com/topics/dsh-plugin)
 
 DSH(DeepSeek Harness)宿主插件:模仿 Trae 的 stop-hook 配置(hooks.json 的
 PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;在主会话
 轮次正常结束时,若本轮修改过文件,向主会话注入一段 **notice 形态的合规提醒
 提示词**(source.form='notice' + 一句话 summary,正文带文件清单),由主模型
-当场自行判断:直接收尾 / 简要自查 / 阻塞调用 subagent 深入检查。
+当场自行判断:直接收尾 / 简要自查 / 派 subagent 深入检查(按其结算通知收活)。
 
 > (v0.4.0 变更) 与 0.3.x 的差异:
 > - **收集信源从"会话事件日志 + run_code 源码启发式解析"改为 `tools/result`
@@ -18,6 +18,9 @@ PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;�
 > - 注入消息由裸 plugin 文本改为 **notice 形态**(`form:'notice'` + `summary`
 >   ≤120,`boundContextSummary` 语义),不再以 `[AUTO]` 文本冒充用户输入;
 > - diag 日志路径改为基于 `DSH_HOME`/用户主目录推导,不再硬编码。
+
+> (v0.4.1 变更) 注入正文去掉"阻塞等待"措辞:是否前台等待由会话自身的人格纪律决定,
+> 插件只负责提醒与给出手续 —— 与「永不阻塞」型预设(coordinator)的指令冲突由此消除。
 
 ## 特性
 
@@ -34,7 +37,7 @@ PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;�
 - 每用户输入最多提醒一次(新用户消息经 `agent/pre-step` 复位记录与标记)
 - 只对主会话触发:**GUI 恢复/续写历史会话创建的 fork 会话(带 parentSession、无 origin)视为主会话**,照常提醒;仅排除子代理会话(header `origin: 'subagent'`),避免嵌套提醒
 - 提示词携带**全部用户输入历史**(按时间顺序拼接、跳过插件注入,超长截断保留最新)供对照,
-  不只取最近一条;内置自查清单与处理方式引导(可直接结束 / 阻塞调 subagent 深查)
+  不只取最近一条;内置自查清单与处理方式引导(可直接结束 / 派 subagent 深查,按其结算通知收活)
 - 提醒以 **notice** 消息呈现(`source.form='notice'`,summary 一句话 ≤120),UI 折叠展示、不冒充用户输入
 
 ## 配置(cordis.patch.yml 的 entry config)
@@ -89,7 +92,7 @@ PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;�
   `agent.inject` 注入 notice 提醒 —— 注入 next-step 使本 turn 继续,主模型当场响应;
 - 事件日志兜底:仅当实时记录缺失时,从会话事件取顶层 `tool/call` 的 write/edit;
 - 提示词正文带文件清单、本轮用户输入摘录、自查清单与处理方式引导(可直接结束或
-  阻塞调 subagent/subagent_fork 深查);
+  派 subagent/subagent_fork 深查(按其结算通知收活));
 - **已知边界**:run_code 程序内 PTC 裸写(`await import('node:fs')` 等直接文件
   API,绕过 `tools` 绑定)不产生 `tools/result`,本插件不检测;如需要覆盖请改用
   `tools.write/edit`;
