@@ -1,7 +1,7 @@
 {
   "name": "dsh-host-compliance-check",
   "description": "DSH 宿主插件:模仿 Trae stop-hook —— 主会话轮次结束时若本轮修改过文件(信源:tools/result 实时精确记录,覆盖 write/edit 与 run_code 子派发),注入 notice 形态需求合规提醒,由主模型自行判断",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

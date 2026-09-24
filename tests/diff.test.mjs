@@ -17,7 +17,8 @@
  *  - isRootSession:主会话判定(origin!=='subagent')
  *  - lastUserMessageText:跳过插件注入与 goal、按序拼接、截断保最新、不切代理对
  *  - buildPromptBody:文件清单/自查清单/处理引导/用户历史
- *  - buildNoticeMessage(若 createUserMessage 可剥离注入):source.form='notice' + summary≤120
+ *  - buildNoticeMessage(若 createUserMessage 可剥离注入):source.kind='plugin:compliance-check'
+ *    (会话格式 v4 合法)+ source.form='notice' + summary≤120
  */
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -111,7 +112,7 @@ const agentMsgs = {
   session: {
     snapshotEvents: () => [
       { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第一句' }] } },
-      { type: 'user/message', data: { source: { kind: 'plugin', plugin: 'x' }, content: [{ type: 'text', text: '注入跳过' }] } },
+      { type: 'user/message', data: { source: { kind: 'plugin:x' }, content: [{ type: 'text', text: '注入跳过' }] } },
       { type: 'user/message', data: { source: { kind: 'goal' }, content: [{ type: 'text', text: 'goal 跳过' }] } },
       { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '第二句' }] } },
     ],
@@ -145,13 +146,22 @@ check('prompt.guidance', body.includes('subagent') && body.includes('排除误�
 check('prompt.history', body.includes('## 用户输入历史') && body.includes('改 a 和 b'))
 check('prompt.no-requirement', !buildPromptBody(pfiles, undefined).includes('## 用户输入历史'))
 
-// ── 七、buildNoticeMessage(source notice 形态) ──
+// ── 七、buildNoticeMessage(source notice 形态,会话格式 v4 合法) ──
+// v4 准入规则(镜像 dsh-session-format-v3-to-v4 的 source() 校验):kind 必须是
+// 非空字符串,且不得等于已退役的 'plugin' —— 第三方插件取 'plugin:<插件名>'。
+const isV4SourceAdmitted = (source) =>
+  typeof source?.kind === 'string' && source.kind.length > 0 && source.kind !== 'plugin'
 const notice = buildNoticeMessage({ content: '正文', summary: 's'.repeat(200) })
 check('notice.role-user', notice.role === 'user')
-check('notice.source-plugin', notice.source?.kind === 'plugin' && notice.source?.plugin === 'compliance-check')
+check('notice.source-kind', notice.source?.kind === 'plugin:compliance-check', String(notice.source?.kind))
+check('notice.source-no-plugin-field', !Object.hasOwn(notice.source ?? {}, 'plugin'))
+check('notice.source-v4-admitted', isV4SourceAdmitted(notice.source))
 check('notice.source-form', notice.source?.form === 'notice')
 check('notice.summary-bounded', notice.source?.summary?.length <= 120, String(notice.source?.summary?.length))
 check('notice.content', notice.content?.[0]?.text === '正文')
+// 默认 summary(未传时)同样受 120 上限约束
+const noticeDefault = buildNoticeMessage({ content: '正文' })
+check('notice.summary-default', noticeDefault.source?.summary?.length > 0 && noticeDefault.source.summary.length <= 120)
 
 // safeSlice(代理对不切断)
 const emoji = 'A'.repeat(100) + '🎉'.repeat(50)

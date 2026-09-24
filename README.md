@@ -1,14 +1,15 @@
 # dsh-host-compliance-check
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](package.json)
 [![DSH Plugin](https://img.shields.io/badge/dsh-plugin-8A2BE2.svg)](https://github.com/topics/dsh-plugin)
 
 DSH(DeepSeek Harness)宿主插件:模仿 Trae 的 stop-hook 配置(hooks.json 的
 PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;在主会话
 轮次正常结束时,若本轮修改过文件,向主会话注入一段 **notice 形态的合规提醒
-提示词**(source.form='notice' + 一句话 summary,正文带文件清单),由主模型
-当场自行判断:直接收尾 / 简要自查 / 派 subagent 深入检查(按其结算通知收活)。
+提示词**(`source.kind='plugin:compliance-check'` + `source.form='notice'` +
+一句话 summary,正文带文件清单),由主模型当场自行判断:直接收尾 / 简要自查 /
+派 subagent 深入检查(按其结算通知收活)。
 
 > (v0.4.0 变更) 与 0.3.x 的差异:
 > - **收集信源从"会话事件日志 + run_code 源码启发式解析"改为 `tools/result`
@@ -21,6 +22,15 @@ PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;�
 
 > (v0.4.1 变更) 注入正文去掉"阻塞等待"措辞:是否前台等待由会话自身的人格纪律决定,
 > 插件只负责提醒与给出手续 —— 与「永不阻塞」型预设(coordinator)的指令冲突由此消除。
+
+> (v0.4.2 起) **会话格式 v4 兼容**(DSH **0.1.7-rc.1** 起):v4 的准入规则
+> 要求 `user/message` 的 `source.kind` 是**非空字符串**且**不得等于 `'plugin'`**
+> (旧版"插件包装"写法已退役),违反时该消息落盘被拒、**整轮以
+> `format v4 message requires a producer-owned source kind` 失败**(错误码 UNKNOWN)。
+> 第三方插件注入消息的正确写法是 `kind: 'plugin:<插件名>'`,且 source 里**不再有**
+> `plugin` 字段 ⇒ 本插件注入消息由 `{ kind:'plugin', plugin:'compliance-check' }`
+> 改为 `{ kind:'plugin:compliance-check' }`;`form` / `summary` 语义与 UI 折叠展示不变
+> (UI 按 `source.kind !== 'user'` 判为注入行、按 `source.form` 折叠)。
 
 ## 特性
 
@@ -38,7 +48,7 @@ PostToolUse + Stop → decision 移交),**不自动派发检查子智能体**;�
 - 只对主会话触发:**GUI 恢复/续写历史会话创建的 fork 会话(带 parentSession、无 origin)视为主会话**,照常提醒;仅排除子代理会话(header `origin: 'subagent'`),避免嵌套提醒
 - 提示词携带**全部用户输入历史**(按时间顺序拼接、跳过插件注入,超长截断保留最新)供对照,
   不只取最近一条;内置自查清单与处理方式引导(可直接结束 / 派 subagent 深查,按其结算通知收活)
-- 提醒以 **notice** 消息呈现(`source.form='notice'`,summary 一句话 ≤120),UI 折叠展示、不冒充用户输入
+- 提醒以 **notice** 消息呈现(`source.kind='plugin:compliance-check'` + `source.form='notice'`,summary 一句话 ≤120),UI 折叠展示、不冒充用户输入
 
 ## 配置(cordis.patch.yml 的 entry config)
 
