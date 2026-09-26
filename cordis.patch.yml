@@ -1,0 +1,26 @@
+# dsh-host-compliance-check 的 profile 层 patch。
+# 2026-09-25 从 profile 的 cordis.patch.yml 迁入：本包自当日成为组合包(bundle)，
+# 宿主按 profile 的 dsh.profile.bundles 加载本包时应用本文件。
+# 启停：本包行内自带 disabled: true(停用态，与迁移前一致)。插件页那个开关的"启用"分支只删自己
+#   追加的标记条目、不写 disabled: false ⇒ 用它"打开"不会生效；本包又不在 bundles 里，整包不加载。
+#   要真正启用需两步：① 把 `dsh-host-compliance-check` 加进 profile `package.json` 的 `dsh.profile.bundles`；
+#   ② 在 profile `cordis.patch.yml` 末尾追加按 id 覆写 `- id: compliance-check` + `disabled: false`。
+# 行 id `compliance-check` 是上述开关与 settings 命名空间的寻址键，勿改。
+#
+# ── 以下为迁移前留在 profile cordis.patch.yml 的原始注释，仅作依据保存 ──────
+# （其中的"生效/回滚"路径已随迁移失效：本行现由包内本文件提供，
+#   回滚请改用插件页总开关，或 dshpm remove dsh-host-compliance-check。）
+# ── End-of-turn compliance reminder: 模仿 Trae stop-hook 的 decision 移交 ──
+# (v0.4.0,迁移自 Trae hooks.json 的 PostToolUse + Stop)
+# 主会话轮次结束时,若本轮修改过文件(信源:tools/result 实时精确记录 ——
+# write/edit 顶层调用与 run_code 内子派发均触发),不自动派发检查子智能体,
+# 只注入 notice 形态的合规提醒(带文件清单与自查清单),由主模型当场自行判断:
+# 直接收尾 / 简要自查 / 派 subagent 深查(按其结算通知收活)。
+# 可选配置(config 字段):skipPaths(跳过路径,过滤后为空则不提醒);
+#   diag: true(写诊断日志到 ~/.dsh/compliance-diag.log,排查用,建议验证期开启)
+- insert:
+    - id: compliance-check
+      name: 'dsh-host-compliance-check'
+      disabled: true
+      config:
+        diag: true
